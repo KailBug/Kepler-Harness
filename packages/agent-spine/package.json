@@ -1,0 +1,17 @@
+{
+    "name": "@kepler/agent-spine",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "exports": "./src/index.ts",
+    "dependencies": {
+        "@kepler/agent-loop": "0.1.0",
+        "@kepler/llm": "0.1.0",
+        "@kepler/session": "0.1.0",
+        "@kepler/system-prompt": "0.1.0",
+        "@kepler/tools": "0.1.0"
+    },
+    "peerDependencies": {
+        "@deepseek-ai/cordis": "4.1.0"
+    }
+}
