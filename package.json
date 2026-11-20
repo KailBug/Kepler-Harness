@@ -1,0 +1,28 @@
+{
+  "name": "kepler-harness",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node ./test-cordis.mjs",
+    "test:deepseek": "node --env-file=.env --test --test-name-pattern=真实.API ./test-cordis.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KailBug/Kepler-Harness.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/KailBug/Kepler-Harness/issues"
+  },
+  "homepage": "https://github.com/KailBug/Kepler-Harness#readme",
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.1.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}
