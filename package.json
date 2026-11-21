@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "test": "node ./test-cordis.mjs",
-    "test:deepseek": "node --env-file=.env --test --test-name-pattern=真实.API ./test-cordis.mjs"
+    "test:deepseek": "node --env-file=.env --test --test-name-pattern=真实.API ./test-cordis.mjs",
+    "dev:web": "npm run dev -w @kepler/web",
+    "build:web": "npm run build -w @kepler/web",
+    "start": "npm run start -w @kepler/web"
   },
   "repository": {
     "type": "git",
@@ -22,7 +25,11 @@
   "dependencies": {
     "@deepseek-ai/cordis": "4.1.0"
   },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/*"
   ]
 }
