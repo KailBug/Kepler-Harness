@@ -1,3 +1,5 @@
+// 工具注册表与执行管道：pre-execute（拦截/审批挂起）-> execute -> post-execute。
+
 import { type Context, Service } from '@deepseek-ai/cordis'
 import type { ToolSchema } from '@kepler/llm'
 
@@ -5,21 +7,30 @@ export interface ToolExecution {
     name: string
     args: any
     sessionId?: string
+    toolCallId?: string
+    turnId?: string
+    // 人工审批通过后恢复执行时为 true，策略插件可据此放行
+    approved?: boolean
 }
 
 export interface ToolDefinition extends ToolSchema {
+    // 为 true 时，默认在 pre-execute 阶段挂起等待人工审批
+    requireApproval?: boolean
     execute(args: any, exec: ToolExecution): string | Promise<string>
 }
 
 export interface ToolResult {
     content: string
     isError?: boolean
-}
-
-export interface ToolDecision {
-    allow: boolean
+    // pre-execute 返回 suspend 时为 true，表示尚未执行、等待人工审批
+    suspended?: boolean
     reason?: string
 }
+
+export type ToolDecision =
+    | { allow: true; suspend?: false; reason?: string }
+    | { allow: false; suspend?: false; reason?: string }
+    | { allow?: false; suspend: true; reason?: string }
 
 type Awaitable<T> = T | Promise<T>
 
@@ -67,13 +78,22 @@ export class ToolRuntime extends Service {
     }
 
     async execute(exec: ToolExecution): Promise<ToolResult> {
-        const decision = await this.ctx.waterfall('tools/pre-execute', exec, () => ({ allow: true }))
+        const tool = this.tools.get(exec.name)
+        const decision = await this.ctx.waterfall('tools/pre-execute', exec, (): ToolDecision => {
+            if (tool?.requireApproval && !exec.approved) {
+                return { suspend: true, reason: `工具 ${exec.name} 需要人工审批` }
+            }
+            return { allow: true }
+        })
+        if (decision.suspend) {
+            return { content: '', suspended: true, reason: decision.reason }
+        }
+
         let result: ToolResult
         if (!decision.allow) {
             result = { content: `已拦截：${decision.reason ?? '不允许调用'} ${exec.name}`, isError: true }
         } else {
             result = await this.ctx.waterfall('tools/execute', exec, async () => {
-                const tool = this.tools.get(exec.name)
                 if (!tool) return { content: `没有这个工具：${exec.name}`, isError: true }
                 try {
                     return { content: await tool.execute(exec.args, exec) }
