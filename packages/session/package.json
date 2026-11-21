@@ -5,7 +5,8 @@
     "type": "module",
     "exports": "./src/index.ts",
     "dependencies": {
-        "@kepler/llm": "0.1.0"
+        "@kepler/llm": "0.1.0",
+        "@kepler/protocol": "0.1.0"
     },
     "peerDependencies": {
         "@deepseek-ai/cordis": "4.1.0"
