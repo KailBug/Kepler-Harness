@@ -3,5 +3,6 @@
         "module": "NodeNext",
         "allowImportingTsExtensions": true,
         "noEmit": true
-    }
+    },
+    "exclude": ["node_modules", "apps/web/src", "apps/web/dist"]
 }
