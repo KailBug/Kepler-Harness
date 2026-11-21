@@ -6,6 +6,7 @@
     "exports": "./src/index.ts",
     "dependencies": {
         "@kepler/llm": "0.1.0",
+        "@kepler/protocol": "0.1.0",
         "@kepler/session": "0.1.0",
         "@kepler/system-prompt": "0.1.0",
         "@kepler/tools": "0.1.0"
