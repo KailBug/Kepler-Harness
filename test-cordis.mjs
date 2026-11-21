@@ -7,6 +7,7 @@ import * as deepseek from '@kepler/llm-deepseek'
 import SessionStore from '@kepler/session'
 import SystemPrompt from '@kepler/system-prompt'
 import ToolRuntime from '@kepler/tools'
+import * as webserver from '@kepler/webserver'
 
 const persona = '你是 Kepler 助手。'
 const addSchema = {
@@ -65,25 +66,60 @@ describe('LLM', () => {
 })
 
 describe('Session', () => {
-    it('查找会话、转换消息和广播事件', async t => {
+    it('查找会话、转换消息、递增 seq 与广播事件', async t => {
         const app = createContext(t)
         await app.plugin(SessionStore)
         const observed = []
         app.on('session/created', session => observed.push(`created:${session.id}`))
-        app.on('session/event', (session, entry) => observed.push(`${session.id}:${entry.type}`))
+        app.on('session/event', (session, entry) => observed.push(`${session.id}:${entry.seq}:${entry.type}`))
 
         const session = app.sessions.create('demo')
         assert.equal(app.sessions.get('demo')?.id, 'demo')
-        session.append({ type: 'user', text: '2 + 3 等于多少？' })
-        session.append({ type: 'assistant', text: '', toolCalls: [addCall] })
-        session.append({ type: 'tool-result', toolCallId: addCall.id, name: addCall.name, content: '5' })
+        const e1 = await session.append({ type: 'user', text: '2 + 3 等于多少？' }, 'turn-1')
+        const e2 = await session.append({ type: 'assistant', text: '', toolCalls: [addCall] }, 'turn-1')
+        const e3 = await session.append({ type: 'tool-result', toolCallId: addCall.id, name: addCall.name, content: '5' }, 'turn-1')
 
+        assert.deepEqual([e1.seq, e2.seq, e3.seq], [1, 2, 3])
+        assert.equal(e1.turnId, 'turn-1')
+        assert.equal(e2.sessionId, 'demo')
+        assert.ok(e1.id && e2.id && e1.id !== e2.id)
+        assert.deepEqual(session.eventsSince(1).map(e => e.seq), [2, 3])
         assert.deepEqual(session.deriveMessages(), [
             { role: 'user', content: '2 + 3 等于多少？' },
             { role: 'assistant', content: '', toolCalls: [addCall] },
             { role: 'tool', content: '5', toolCallId: addCall.id },
         ])
-        assert.deepEqual(observed, ['created:demo', 'demo:user', 'demo:assistant', 'demo:tool-result'])
+        assert.deepEqual(observed, ['created:demo', 'demo:1:user', 'demo:2:assistant', 'demo:3:tool-result'])
+    })
+
+    it('从已有事件日志恢复会话并校验 seq 单调性', async t => {
+        const app = createContext(t)
+        await app.plugin(SessionStore)
+        const original = app.sessions.create('s-1')
+        await original.append({ type: 'user', text: 'hi' }, 't-1')
+        await original.append({ type: 'assistant', text: 'hello' }, 't-1')
+
+        const restored = app.sessions.restore('s-1', original.log)
+        assert.equal(restored.lastSeq, 2)
+        const e3 = await restored.append({ type: 'user', text: 'next' }, 't-2')
+        assert.equal(e3.seq, 3)
+        assert.equal(restored.deriveMessages().length, 3)
+        assert.throws(() => app.sessions.restore('s-1', [e3, original.log[0]]), /invalid session event seq/)
+        assert.throws(() => app.sessions.restore('other', [original.log[0]]), /does not match/)
+    })
+
+    it('Write-Ahead：持久化失败时不修改内存日志也不广播事件', async t => {
+        const app = createContext(t)
+        await app.plugin(SessionStore)
+        const session = app.sessions.create('wa')
+        let emitted = 0
+        app.on('session/event', () => emitted++)
+        app.on('session/persist', () => { throw new Error('disk full') })
+
+        await assert.rejects(session.append({ type: 'user', text: 'hello' }, 't-1'), /disk full/)
+        assert.equal(session.log.length, 0)
+        assert.equal(session.lastSeq, 0)
+        assert.equal(emitted, 0)
     })
 })
 
@@ -182,7 +218,7 @@ describe('AgentLoop', () => {
         })
 
         assert.equal(await app.agentLoop.run(session, '2 + 3 等于多少？', signal), '结果是5')
-        assert.deepEqual(session.log.map(entry => entry.type), ['user', 'assistant', 'tool-result', 'assistant'])
+        assert.deepEqual(session.log.map(entry => entry.type), ['user', 'assistant', 'tool-result', 'assistant', 'turn-ended'])
         assert.deepEqual(events, ['busy', 1, 'call-1', 2, '结果是', '5', 'idle'])
     })
 
@@ -205,6 +241,86 @@ describe('AgentLoop', () => {
         app.on('agent/status', (_, status) => statuses.push(status))
         await assert.rejects(app.agentLoop.run(app.sessions.create(), '你好'), /no llm adapter registered/)
         assert.deepEqual(statuses, ['busy', 'idle'])
+    })
+
+    it('Write-Ahead：assistant 落盘失败时不执行有副作用的工具', async t => {
+        const app = await createAgent(t)
+        let executed = 0
+        app.tools.register({ ...addSchema, execute: ({ a, b }) => { executed++; return String(a + b) } })
+        app.llm.registerAdapter('tool-once', {
+            async *stream() { yield { type: 'tool-call', call: addCall } },
+        })
+        app.on('session/persist', (_session, event, next) => {
+            if (event.type === 'assistant') throw new Error('stale epoch')
+            return next()
+        })
+        const session = app.sessions.create()
+        await assert.rejects(app.agentLoop.submit(session, '2 + 3'), /stale epoch/)
+        assert.equal(executed, 0)
+    })
+
+    it('断点恢复：从已落盘的 assistant(toolCalls) 恢复执行，不重复调用首次 LLM', async t => {
+        const app = await createAgent(t)
+        let toolRuns = 0
+        let llmRuns = 0
+        app.tools.register({ ...addSchema, execute: ({ a, b }) => { toolRuns++; return String(a + b) } })
+        app.llm.registerAdapter('after-tool', {
+            async *stream({ messages }) {
+                llmRuns++
+                assert.equal(messages.at(-1).role, 'tool')
+                yield { type: 'text', text: `答案是 ${messages.at(-1).content}` }
+            },
+        })
+        // 模拟 Worker 在落盘 assistant(toolCalls) 后宕机，新进程通过 restore + resume 接管
+        const restored = app.sessions.restore('crash-1', [
+            { id: 'e1', seq: 1, sessionId: 'crash-1', turnId: 't1', ts: 1, type: 'user', text: '2 + 3' },
+            { id: 'e2', seq: 2, sessionId: 'crash-1', turnId: 't1', ts: 2, type: 'assistant', text: '', toolCalls: [addCall] },
+        ])
+        const result = await app.agentLoop.resume(restored)
+        assert.equal(result.status, 'completed')
+        assert.equal(result.text, '答案是 5')
+        assert.equal(toolRuns, 1)
+        assert.equal(llmRuns, 1)
+    })
+
+    it('HITL 审批：挂起、批准后恢复执行，以及拒绝后回传错误结果', async t => {
+        const app = await createAgent(t)
+        let toolRuns = 0
+        app.tools.register({
+            ...addSchema,
+            requireApproval: true,
+            execute: ({ a, b }) => { toolRuns++; return String(a + b) },
+        })
+        app.llm.registerAdapter('scripted', {
+            async *stream({ messages }) {
+                const last = messages.at(-1)
+                if (last.role === 'user') return yield { type: 'tool-call', call: addCall }
+                yield { type: 'text', text: `收到工具反馈：${last.content}` }
+            },
+        })
+
+        // 分支 1：批准
+        const s1 = app.sessions.create('approve')
+        const suspended = await app.agentLoop.submit(s1, '算一下')
+        assert.equal(suspended.status, 'suspended')
+        assert.equal(toolRuns, 0)
+        assert.equal(s1.pendingApprovals().length, 1)
+
+        await s1.append({ type: 'approval-resolved', toolCallId: addCall.id, approved: true }, suspended.turnId)
+        const resumed = await app.agentLoop.resume(s1)
+        assert.equal(resumed.status, 'completed')
+        assert.equal(resumed.text, '收到工具反馈：5')
+        assert.equal(toolRuns, 1)
+
+        // 分支 2：拒绝
+        const s2 = app.sessions.create('deny')
+        const suspended2 = await app.agentLoop.submit(s2, '再算一下')
+        assert.equal(suspended2.status, 'suspended')
+        await s2.append({ type: 'approval-resolved', toolCallId: addCall.id, approved: false, reason: '高危' }, suspended2.turnId)
+        const denied = await app.agentLoop.resume(s2)
+        assert.equal(denied.status, 'completed')
+        assert.match(denied.text, /审批未通过：高危/)
+        assert.equal(toolRuns, 1)
     })
 })
 
@@ -281,7 +397,8 @@ describe('DeepSeek', () => {
         await assert.rejects(app.agentLoop.run(session, '你好'), /DeepSeek API 429/)
         fetchMock.mock.mockImplementation(async () => new Response('data: {"choices":[]}\n\n'))
         await assert.rejects(app.agentLoop.run(session, '重试'), /ended before \[DONE\]/)
-        assert.ok(session.log.every(entry => entry.type === 'user'))
+        assert.deepEqual(session.log.map(entry => entry.type), ['user', 'turn-ended', 'user', 'turn-ended'])
+        assert.ok(session.log.filter(e => e.type === 'turn-ended').every(e => e.status === 'failed'))
     })
 
     it('真实 API 流式对话', { skip: process.env.npm_lifecycle_event !== 'test:deepseek' && process.env.KEPLER_TEST_DEEPSEEK !== '1' }, async t => {
@@ -299,5 +416,105 @@ describe('DeepSeek', () => {
         assert.ok(reply.trim())
         assert.equal(chunks.join(''), reply)
         assert.equal(session.deriveMessages().at(-1).content, reply)
+    })
+})
+
+describe('WebServer', () => {
+    async function readSseUntil(url, stopWhen, headers = {}) {
+        const abort = new AbortController()
+        const response = await fetch(url, { headers, signal: abort.signal })
+        assert.equal(response.status, 200)
+        const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+        const frames = []
+        let buffer = ''
+        try {
+            while (true) {
+                const { value, done } = await reader.read()
+                if (done) break
+                buffer += value
+                const parts = buffer.split('\n\n')
+                buffer = parts.pop()
+                for (const part of parts) {
+                    const event = /^event: (.*)$/m.exec(part)?.[1]
+                    const dataRaw = /^data: (.*)$/m.exec(part)?.[1]
+                    const id = /^id: (.*)$/m.exec(part)?.[1]
+                    if (!event || !dataRaw) continue
+                    const frame = { id: id ? Number(id) : undefined, event, data: JSON.parse(dataRaw) }
+                    frames.push(frame)
+                    if (stopWhen(frame, frames)) {
+                        abort.abort()
+                        return frames
+                    }
+                }
+            }
+        } catch (error) {
+            if (!abort.signal.aborted) throw error
+        }
+        return frames
+    }
+
+    it('命令与 SSE 事件流分离：提交消息、按 since 补发、HTTP 审批并恢复', async t => {
+        const app = await createAgent(t)
+        let executed = 0
+        app.tools.register({
+            ...addSchema,
+            requireApproval: true,
+            execute: ({ a, b }) => { executed++; return String(a + b) },
+        })
+        app.llm.registerAdapter('scripted', {
+            async *stream({ messages }) {
+                const last = messages.at(-1)
+                if (last.role === 'user') return yield { type: 'tool-call', call: addCall }
+                yield { type: 'text', text: `结果=${last.content}` }
+            },
+        })
+
+        let baseUrl = ''
+        await app.plugin(webserver, { port: 0, onListen: ({ url }) => { baseUrl = url } })
+
+        // 1. 创建会话
+        const created = await fetch(`${baseUrl}/api/sessions`, { method: 'POST', body: '{}' })
+        assert.equal(created.status, 201)
+        const { session } = await created.json()
+
+        // 2. 先订阅 SSE，再提交消息（验证实时推送直到挂起等待审批）
+        const streamPromise = readSseUntil(
+            `${baseUrl}/api/sessions/${session.id}/events`,
+            frame => frame.event === 'event' && frame.data.type === 'turn-ended' && frame.data.status === 'suspended',
+        )
+        const sent = await fetch(`${baseUrl}/api/sessions/${session.id}/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: '算 2 + 3' }),
+        })
+        assert.equal(sent.status, 202)
+        const { turnId } = await sent.json()
+        assert.ok(turnId)
+
+        const firstFrames = await streamPromise
+        const firstEvents = firstFrames.filter(f => f.event === 'event').map(f => f.data)
+        assert.deepEqual(firstEvents.map(e => e.type), ['user', 'assistant', 'approval-requested', 'turn-ended'])
+        const lastSeq = firstEvents.at(-1).seq
+        assert.equal(executed, 0)
+
+        // 3. 通过 Last-Event-ID 断线续传，批准工具后收到后续事件直到完成
+        const resumePromise = readSseUntil(
+            `${baseUrl}/api/sessions/${session.id}/events`,
+            frame => frame.event === 'event' && frame.data.type === 'turn-ended' && frame.data.status === 'completed',
+            { 'Last-Event-ID': String(lastSeq) },
+        )
+        const approved = await fetch(`${baseUrl}/api/sessions/${session.id}/approvals/${addCall.id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approved: true }),
+        })
+        assert.equal(approved.status, 202)
+
+        const resumedFrames = await resumePromise
+        const resumedEvents = resumedFrames.filter(f => f.event === 'event').map(f => f.data)
+        assert.ok(resumedEvents.every(e => e.seq > lastSeq))
+        assert.deepEqual(resumedEvents.map(e => e.type), ['approval-resolved', 'tool-result', 'assistant', 'turn-ended'])
+        assert.equal(resumedEvents.find(e => e.type === 'assistant').text, '结果=5')
+        assert.equal(executed, 1)
     })
 })
