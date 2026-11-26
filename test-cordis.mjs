@@ -4,10 +4,15 @@ import { Context } from '@deepseek-ai/cordis'
 import * as agentSpine from '@kepler/agent-spine'
 import LlmRuntime from '@kepler/llm'
 import * as deepseek from '@kepler/llm-deepseek'
+import { create } from '@bufbuild/protobuf'
+import { Code, ConnectError } from '@connectrpc/connect'
+import { LeaseSchema, WorkerTaskSchema } from '@kepler/protocol/connect'
+import RemoteSessionStore, { fromProtoEvent, toProtoEvent } from '@kepler/session-remote'
 import SessionStore from '@kepler/session'
 import SystemPrompt from '@kepler/system-prompt'
 import ToolRuntime from '@kepler/tools'
 import * as webserver from '@kepler/webserver'
+import KeplerWorker from '@kepler/worker'
 
 const persona = '你是 Kepler 助手。'
 const addSchema = {
@@ -516,5 +521,90 @@ describe('WebServer', () => {
         assert.deepEqual(resumedEvents.map(e => e.type), ['approval-resolved', 'tool-result', 'assistant', 'turn-ended'])
         assert.equal(resumedEvents.find(e => e.type === 'assistant').text, '结果=5')
         assert.equal(executed, 1)
+    })
+})
+
+describe('KeplerWorker', () => {
+    it('SessionEvent 与 Protobuf 双向转换无损', () => {
+        const samples = [
+            { id: 'e1', seq: 1, sessionId: 's1', turnId: 't1', ts: 100, type: 'user', text: 'hi' },
+            { id: 'e2', seq: 2, sessionId: 's1', turnId: 't1', ts: 101, type: 'assistant', text: '', toolCalls: [addCall] },
+            { id: 'e3', seq: 3, sessionId: 's1', turnId: 't1', ts: 102, type: 'approval-requested', toolCallId: 'call-1', name: 'add', arguments: '{"a":2,"b":3}', reason: '需审批' },
+            { id: 'e4', seq: 4, sessionId: 's1', turnId: 't1', ts: 103, type: 'approval-resolved', toolCallId: 'call-1', approved: true, reason: 'ok' },
+            { id: 'e5', seq: 5, sessionId: 's1', turnId: 't1', ts: 104, type: 'tool-result', toolCallId: 'call-1', name: 'add', content: '5' },
+            { id: 'e6', seq: 6, sessionId: 's1', turnId: 't1', ts: 105, type: 'turn-ended', status: 'completed' },
+        ]
+        for (const ev of samples) {
+            const roundTrip = fromProtoEvent(toProtoEvent(ev))
+            assert.deepEqual(roundTrip, ev)
+        }
+    })
+
+    it('拉取任务、Write-Ahead 远端落盘、处理审批挂起与僵尸 epoch 退出', async t => {
+        const app = await createAgent(t)
+        let toolRuns = 0
+        app.tools.register({
+            ...addSchema,
+            execute: ({ a, b }) => { toolRuns++; return String(a + b) },
+        })
+        app.llm.registerAdapter('scripted', {
+            async *stream({ messages }) {
+                const last = messages.at(-1)
+                if (last.role === 'user') return yield { type: 'tool-call', call: addCall }
+                yield { type: 'text', text: `答案=${last.content}` }
+            },
+        })
+
+        let seq = 1
+        const appended = []
+        const completed = []
+        const failed = []
+        let rejectAppend = false
+
+        const mockClient = {
+            async acquireTask() {
+                return {
+                    task: create(WorkerTaskSchema, {
+                        taskId: 'task-1',
+                        sessionId: 'sess-remote-1',
+                        turnId: 'turn-1',
+                        agentId: 'default',
+                        lease: create(LeaseSchema, { leaseId: 'lease-1', epoch: 1n, expiresAtMs: BigInt(Date.now() + 30_000) }),
+                        events: [toProtoEvent({ id: 'u1', seq: 1, sessionId: 'sess-remote-1', turnId: 'turn-1', ts: 1, type: 'user', text: '2+3' })],
+                    }),
+                }
+            },
+            async appendEvents(req) {
+                if (rejectAppend) throw new ConnectError('stale lease epoch', Code.FailedPrecondition)
+                assert.equal(req.leaseId, 'lease-1')
+                assert.equal(req.epoch, 1n)
+                for (const pb of req.events) {
+                    seq++
+                    appended.push(fromProtoEvent(pb))
+                }
+                return { lastSeq: BigInt(seq) }
+            },
+            async renewLease() { return {} },
+            async completeTask(req) { completed.push(req); return {} },
+            async suspendTask() { return {} },
+            async failTask(req) { failed.push(req); return {} },
+        }
+
+        await app.plugin(RemoteSessionStore, { client: mockClient, strict: true })
+        await app.plugin(KeplerWorker, { workerId: 'w-test', autoStart: false })
+
+        // 1. 正常完成：Write-Ahead 远端落盘 4 条事件并 completeTask
+        assert.equal(await app.worker.runOnce(), true)
+        assert.deepEqual(appended.map(e => e.type), ['assistant', 'tool-result', 'assistant', 'turn-ended'])
+        assert.equal(toolRuns, 1)
+        assert.equal(completed.length, 1)
+        assert.equal(failed.length, 0)
+
+        // 2. 僵尸 epoch：appendEvents 报 FailedPrecondition -> 不执行工具，也不调用 failTask
+        rejectAppend = true
+        seq = 1
+        assert.equal(await app.worker.runOnce(), true)
+        assert.equal(toolRuns, 1)
+        assert.equal(failed.length, 0)
     })
 })
