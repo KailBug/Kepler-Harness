@@ -1,0 +1,17 @@
+{
+    "name": "@kepler/worker",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "exports": "./src/index.ts",
+    "dependencies": {
+        "@connectrpc/connect": "^2.0.0",
+        "@kepler/agent-loop": "0.1.0",
+        "@kepler/protocol": "0.1.0",
+        "@kepler/session": "0.1.0",
+        "@kepler/session-remote": "0.1.0"
+    },
+    "peerDependencies": {
+        "@deepseek-ai/cordis": "4.1.0"
+    }
+}
