@@ -1,0 +1,17 @@
+{
+    "name": "@kepler/session-remote",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "exports": "./src/index.ts",
+    "dependencies": {
+        "@bufbuild/protobuf": "^2.10.0",
+        "@connectrpc/connect": "^2.0.0",
+        "@connectrpc/connect-node": "^2.0.0",
+        "@kepler/protocol": "0.1.0",
+        "@kepler/session": "0.1.0"
+    },
+    "peerDependencies": {
+        "@deepseek-ai/cordis": "4.1.0"
+    }
+}
