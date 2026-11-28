@@ -6,6 +6,7 @@
   "scripts": {
     "test": "node ./test-cordis.mjs",
     "test:e2e": "node ./test-e2e-kepler.mjs",
+    "test:e2e:w3": "node ./test-e2e-w3.mjs",
     "test:deepseek": "node --env-file=.env --test --test-name-pattern=真实.API ./test-cordis.mjs",
     "dev:web": "npm run dev -w @kepler/web",
     "build:web": "npm run build -w @kepler/web",
