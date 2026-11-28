@@ -9,6 +9,7 @@ import { Context } from '@deepseek-ai/cordis'
 import * as agentSpine from '@kepler/agent-spine'
 import * as deepseek from '@kepler/llm-deepseek'
 import RemoteSessionStore from '@kepler/session-remote'
+import McpTools from '@kepler/tools-mcp'
 import KeplerWorker from '@kepler/worker'
 
 const env = process.env
@@ -37,7 +38,11 @@ if (apiKey) {
     app.logger('worker-app').warn('未设置 DEEPSEEK_API_KEY，收到任务时将缺少模型适配器')
 }
 
-// 3. 托管模式插件：远端持久化 + Worker 拉任务循环
+// 3. 托管模式插件：MCP 工具发现 + 远端持久化 + Worker 拉任务循环
+if (env.KEPLER_MCP_ENABLED !== 'false') {
+    const mcpUrl = env.KEPLER_MCP_URL ?? `${keplerUrl.replace(/\/+$/, '')}/mcp`
+    await app.plugin(McpTools, { url: mcpUrl })
+}
 await app.plugin(RemoteSessionStore, { baseUrl: keplerUrl, strict: true })
 await app.plugin(KeplerWorker, {
     workerId: env.KEPLER_WORKER_ID,
