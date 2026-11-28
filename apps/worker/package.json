@@ -10,6 +10,7 @@
         "@kepler/agent-spine": "0.1.0",
         "@kepler/llm-deepseek": "0.1.0",
         "@kepler/session-remote": "0.1.0",
+        "@kepler/tools-mcp": "0.1.0",
         "@kepler/worker": "0.1.0"
     },
     "peerDependencies": {
