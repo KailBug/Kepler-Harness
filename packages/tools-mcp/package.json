@@ -1,0 +1,15 @@
+{
+    "name": "@kepler/tools-mcp",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "exports": "./src/index.ts",
+    "dependencies": {
+        "@kepler/tools": "0.1.0",
+        "@modelcontextprotocol/sdk": "^1.12.0",
+        "zod": "^3.24.2"
+    },
+    "peerDependencies": {
+        "@deepseek-ai/cordis": "4.1.0"
+    }
+}
