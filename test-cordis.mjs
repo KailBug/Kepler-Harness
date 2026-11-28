@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import { describe, it } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import * as agentSpine from '@kepler/agent-spine'
@@ -11,6 +12,7 @@ import RemoteSessionStore, { fromProtoEvent, toProtoEvent } from '@kepler/sessio
 import SessionStore from '@kepler/session'
 import SystemPrompt from '@kepler/system-prompt'
 import ToolRuntime from '@kepler/tools'
+import McpTools from '@kepler/tools-mcp'
 import * as webserver from '@kepler/webserver'
 import KeplerWorker from '@kepler/worker'
 
@@ -606,5 +608,113 @@ describe('KeplerWorker', () => {
         assert.equal(await app.worker.runOnce(), true)
         assert.equal(toolRuns, 1)
         assert.equal(failed.length, 0)
+    })
+})
+
+describe('McpTools', () => {
+    it('Zod 校验非法配置、自动发现 MCP 工具、透传幂等 _meta 并触发 HITL 审批与卸载清理', async t => {
+        const app = await createAgent(t)
+
+        // 1. Zod 运行时校验拒绝非法 URL
+        await assert.rejects(async () => { await app.plugin(McpTools, { url: 'ftp://invalid.local/mcp' }) }, /http:\/\/ or https:\/\//)
+
+        // 2. 启动最小 MCP Streamable HTTP 桩服务（模拟 keplerd /mcp）
+        const receivedCalls = []
+        const server = createServer(async (req, res) => {
+            if (req.method === 'DELETE') {
+                res.writeHead(204)
+                return res.end()
+            }
+            if (req.method !== 'POST') {
+                res.writeHead(405)
+                return res.end()
+            }
+            let raw = ''
+            for await (const chunk of req) raw += chunk
+            const rpc = JSON.parse(raw)
+            if (rpc.id === undefined) {
+                res.writeHead(202)
+                return res.end()
+            }
+            let result
+            if (rpc.method === 'initialize') {
+                res.setHeader('Mcp-Session-Id', 'mcp-test-session')
+                result = {
+                    protocolVersion: rpc.params?.protocolVersion ?? '2025-03-26',
+                    capabilities: { tools: {} },
+                    serverInfo: { name: 'mock-kepler-mcp', version: '0.1.0' },
+                }
+            } else if (rpc.method === 'tools/list') {
+                result = {
+                    tools: [
+                        {
+                            name: 'remote_echo',
+                            description: '远端回显工具',
+                            inputSchema: { type: 'object', properties: { msg: { type: 'string' } }, required: ['msg'] },
+                        },
+                        {
+                            name: 'remote_danger',
+                            description: '需要审批的远端高危工具',
+                            inputSchema: { type: 'object', properties: {} },
+                            annotations: { destructiveHint: true },
+                            _meta: { requireApproval: true },
+                        },
+                    ],
+                }
+            } else if (rpc.method === 'tools/call') {
+                receivedCalls.push(rpc.params)
+                result = {
+                    content: [{ type: 'text', text: `echo:${rpc.params.arguments?.msg ?? 'ok'}` }],
+                    isError: false,
+                }
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result }))
+        })
+        await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+        t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
+        const { port } = server.address()
+
+        // 3. 挂载 McpTools：自动发现 2 个工具并注册进 ctx.tools
+        const mcpPlugin = await app.plugin(McpTools, { url: `http://127.0.0.1:${port}/mcp` })
+        assert.deepEqual(app.tools.list().map(tool => tool.name), ['remote_echo', 'remote_danger'])
+
+        // 4. 经 AgentLoop 调用普通工具：透传 _meta（idempotencyKey = sessionId:toolCallId）
+        const echoCall = { id: 'call-echo-1', name: 'remote_echo', arguments: '{"msg":"hello-mcp"}' }
+        const dangerCall = { id: 'call-danger-1', name: 'remote_danger', arguments: '{}' }
+        app.llm.registerAdapter('mcp-scripted', {
+            async *stream({ messages }) {
+                const last = messages.at(-1)
+                if (last.role === 'user' && last.content === 'echo') return yield { type: 'tool-call', call: echoCall }
+                if (last.role === 'user' && last.content === 'danger') return yield { type: 'tool-call', call: dangerCall }
+                yield { type: 'text', text: `done:${last.content}` }
+            },
+        })
+
+        const s1 = app.sessions.create('sess-mcp-1')
+        const r1 = await app.agentLoop.submit(s1, 'echo')
+        assert.equal(r1.status, 'completed')
+        assert.equal(r1.text, 'done:echo:hello-mcp')
+        assert.equal(receivedCalls.length, 1)
+        assert.equal(receivedCalls[0]._meta.idempotencyKey, 'sess-mcp-1:call-echo-1')
+        assert.equal(receivedCalls[0]._meta.sessionId, 'sess-mcp-1')
+        assert.equal(receivedCalls[0]._meta.toolCallId, 'call-echo-1')
+        assert.equal(receivedCalls[0]._meta.turnId, r1.turnId)
+
+        // 5. 经 AgentLoop 调用带 requireApproval 元数据的远端工具 -> 自动挂起等待审批，未发往远端
+        const s2 = app.sessions.create('sess-mcp-2')
+        const r2 = await app.agentLoop.submit(s2, 'danger')
+        assert.equal(r2.status, 'suspended')
+        assert.equal(receivedCalls.length, 1)
+
+        await s2.append({ type: 'approval-resolved', toolCallId: 'call-danger-1', approved: true }, r2.turnId)
+        const r2Done = await app.agentLoop.resume(s2)
+        assert.equal(r2Done.status, 'completed')
+        assert.equal(receivedCalls.length, 2)
+        assert.equal(receivedCalls[1]._meta.idempotencyKey, 'sess-mcp-2:call-danger-1')
+
+        // 6. 卸载插件后自动从 ctx.tools 注销所有远端工具
+        await mcpPlugin.dispose()
+        assert.deepEqual(app.tools.list(), [])
     })
 })
